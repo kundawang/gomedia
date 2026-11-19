@@ -154,4 +154,13 @@ type oggStream struct {
     parser      oggParser
     lost        int
     cache       []byte
+    // chain bookkeeping; every field is re-initialized per segment
+    segment      *chainSegment
+    order        int
+    hasEOS       bool
+    eosGranule   uint64
+    headersDone  bool // all header packets consumed, media packets follow
+    accSamples   uint64
+    frameIndex   uint64
+    mediaPackets uint64
 }

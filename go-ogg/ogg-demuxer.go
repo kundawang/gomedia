@@ -34,13 +34,30 @@ type AudioParam struct {
 type Demuxer struct {
     currentStream *oggStream
     streams       map[uint32]*oggStream
-    headCache     []byte
-    OnPage        func(page *oggPage)
-    OnPacket      func(streamId uint32, granule uint64, packet []byte, lost int)
-    OnFrame       func(streamId uint32, cid codec.CodecID, frame []byte, pts uint64, dts uint64, lost int)
-    state         DemuxState
-    vparam        *VideoParam
-    aparam        *AudioParam
+    // retired holds serial numbers whose segment has been finalized, so a
+    // reuse in a later chain segment can be recognized instead of rejected.
+    retired   map[uint32]bool
+    headCache []byte
+    OnPage    func(page *oggPage)
+    OnPacket  func(streamId uint32, granule uint64, packet []byte, lost int)
+    OnFrame   func(streamId uint32, cid codec.CodecID, frame []byte, pts uint64, dts uint64, lost int)
+    // Chained Ogg callbacks. Left nil, the demuxer behaves exactly as the
+    // single-segment version and only fires OnPage/OnPacket/OnFrame.
+    OnSegmentBegin func(segment int, serial uint32)
+    OnSegmentEnd   func(info *SegmentInfo)
+    OnStreamFormat func(format *StreamFormat)
+    OnChainFrame   func(frame *ChainFrame)
+    state          DemuxState
+    vparam         *VideoParam
+    aparam         *AudioParam
+    // chain state
+    segment      *chainSegment
+    segCount     int
+    baseTimeMs   uint64
+    lastAudioSR  uint32
+    lastAudioCH  uint32
+    lastVideoW   uint32
+    lastVideoH   uint32
 }
 
 func NewDemuxer() *Demuxer {
@@ -48,6 +65,7 @@ func NewDemuxer() *Demuxer {
         headCache: make([]byte, 0, 282),
         state:     DEMUX_PAGE_HEAD,
         streams:   make(map[uint32]*oggStream),
+        retired:   make(map[uint32]bool),
     }
 }
 
@@ -92,10 +110,23 @@ func (demuxer *Demuxer) Input(buf []byte) (err error) {
             if demuxer.OnPage != nil {
                 demuxer.OnPage(page)
             }
-            stream, found := demuxer.streams[page.streamId]
-
-            if found {
-                if stream.currentPage.pageSeq+1 != page.pageSeq {
+            var stream *oggStream
+            if page.isFirstPage {
+                stream, err = demuxer.handleBOS(page)
+                if err != nil {
+                    return err
+                }
+            } else {
+                var found bool
+                stream, found = demuxer.streams[page.streamId]
+                if !found {
+                    // A data page without a preceding BOS: keep going with a
+                    // synthetic stream instead of dropping the page.
+                    if demuxer.segment == nil {
+                        demuxer.beginSegment(page)
+                    }
+                    stream = demuxer.newStream(page)
+                } else if stream.currentPage.pageSeq+1 != page.pageSeq {
                     stream.lost = 1
                     if demuxer.OnPacket != nil {
                         demuxer.OnPacket(stream.streamId, stream.currentPage.granulePos, stream.cache, 1)
@@ -108,14 +139,13 @@ func (demuxer *Demuxer) Input(buf []byte) (err error) {
                 } else {
                     stream.lost = 0
                 }
-            } else {
-                stream = &oggStream{
-                    currentPage: page,
-                    streamId:    page.streamId,
-                    cache:       make([]byte, 0, 1024),
-                    cid:         codec.CODECID_UNRECOGNIZED,
-                }
-                demuxer.streams[page.streamId] = stream
+            }
+            if page.eos {
+                stream.hasEOS = true
+                stream.eosGranule = page.granulePos
+            }
+            if demuxer.segment != nil && !page.isFirstPage {
+                demuxer.segment.hasData = true
             }
             stream.currentPage = page
             demuxer.currentStream = stream
@@ -196,6 +226,20 @@ func (demuxer *Demuxer) Input(buf []byte) (err error) {
             }
             page.cache = page.cache[:0]
             demuxer.state = DEMUX_PAGE_HEAD
+            // All logical streams of this segment have reached EOS: close
+            // the segment now, before the next chain segment's BOS arrives.
+            if demuxer.segment != nil && stream.hasEOS {
+                allEOS := true
+                for _, s := range demuxer.streams {
+                    if !s.hasEOS {
+                        allEOS = false
+                        break
+                    }
+                }
+                if allEOS {
+                    demuxer.endSegment(false)
+                }
+            }
 
         default:
             panic("unknow state")
@@ -222,10 +266,8 @@ func (demuxer *Demuxer) findCodec(stream *oggStream, packet []byte) {
 }
 
 func (demuxer *Demuxer) readPacket(stream *oggStream, packet []byte) error {
-    if stream.currentPage.isFirstPage {
-        if stream.cid == codec.CODECID_UNRECOGNIZED {
-            demuxer.findCodec(stream, packet)
-        }
+    if stream.cid == codec.CODECID_UNRECOGNIZED {
+        demuxer.findCodec(stream, packet)
     }
 
     if stream.cid == codec.CODECID_UNRECOGNIZED {
@@ -234,50 +276,65 @@ func (demuxer *Demuxer) readPacket(stream *oggStream, packet []byte) error {
 
     switch stream.cid {
     case codec.CODECID_AUDIO_OPUS:
-        if stream.currentPage.isFirstPage || stream.currentPage.granulePos == 0 {
-            err := stream.parser.header(stream, packet)
-            if err != nil {
-                return err
-            }
-            if demuxer.aparam == nil {
-                opus, _ := stream.parser.(*opusDemuxer)
-                demuxer.aparam = &AudioParam{
-                    CodecId:        codec.CODECID_AUDIO_OPUS,
-                    SampleRate:     uint32(opus.ctx.SampleRate),
-                    ChannelCount:   uint32(opus.ctx.ChannelCount),
-                    InitialPadding: uint32(opus.ctx.Preskip),
-                    ExtraData:      opus.extradata,
+        // The first packets of every chain segment are the codec headers
+        // (OpusHead then OpusTags), re-parsed from scratch so the new serial
+        // and possibly new format never inherit the previous segment's state.
+        if !stream.headersDone {
+            if bytes.Equal([]byte("OpusHead"), packet[0:8]) ||
+                bytes.Equal([]byte("OpusTags"), packet[0:8]) {
+                if err := stream.parser.header(stream, packet); err != nil {
+                    return err
                 }
+                if bytes.Equal([]byte("OpusHead"), packet[0:8]) {
+                    opus, _ := stream.parser.(*opusDemuxer)
+                    // Rebuilt for every segment: GetAudioParam always reports
+                    // the format of the currently active segment.
+                    demuxer.aparam = &AudioParam{
+                        CodecId:        codec.CODECID_AUDIO_OPUS,
+                        SampleRate:     uint32(opus.ctx.SampleRate),
+                        ChannelCount:   uint32(opus.ctx.ChannelCount),
+                        InitialPadding: uint32(opus.ctx.Preskip),
+                        ExtraData:      opus.extradata,
+                    }
+                    demuxer.emitStreamFormat(stream)
+                }
+                return nil
             }
-        } else {
-            frame, pts, dts := stream.parser.packet(stream, packet)
-            if demuxer.OnFrame != nil {
-                demuxer.OnFrame(stream.streamId, stream.cid, frame, pts, dts, stream.lost)
-            }
+            // First non-header packet ends the header phase of the segment.
+            stream.headersDone = true
         }
+        frame, pts, dts := stream.parser.packet(stream, packet)
+        if demuxer.OnFrame != nil {
+            demuxer.OnFrame(stream.streamId, stream.cid, frame, pts, dts, stream.lost)
+        }
+        demuxer.emitChainFrame(stream, frame, stream.lost)
     case codec.CODECID_VIDEO_VP8:
-        if stream.currentPage.isFirstPage || stream.currentPage.granulePos == 0 {
-            err := stream.parser.header(stream, packet)
-            if err != nil {
-                return err
-            }
-            if demuxer.vparam == nil {
-                vp8, _ := stream.parser.(*vp8Demuxer)
-                demuxer.vparam = &VideoParam{
-                    CodecId:     codec.CODECID_VIDEO_VP8,
-                    Width:       uint32(vp8.width),
-                    Height:      uint32(vp8.height),
-                    FrameRate:   vp8.frameRate,
-                    Aspectratio: vp8.sampleAspectratio,
-                    ExtraData:   vp8.extradata,
+        if !stream.headersDone {
+            if bytes.Equal([]byte("OVP80"), packet[0:5]) {
+                if err := stream.parser.header(stream, packet); err != nil {
+                    return err
                 }
+                if packet[5] == 0x01 {
+                    vp8, _ := stream.parser.(*vp8Demuxer)
+                    demuxer.vparam = &VideoParam{
+                        CodecId:     codec.CODECID_VIDEO_VP8,
+                        Width:       uint32(vp8.width),
+                        Height:      uint32(vp8.height),
+                        FrameRate:   vp8.frameRate,
+                        Aspectratio: vp8.sampleAspectratio,
+                        ExtraData:   vp8.extradata,
+                    }
+                    demuxer.emitStreamFormat(stream)
+                }
+                return nil
             }
-        } else {
-            frame, pts, dts := stream.parser.packet(stream, packet)
-            if demuxer.OnFrame != nil {
-                demuxer.OnFrame(stream.streamId, stream.cid, frame, pts, dts, stream.lost)
-            }
+            stream.headersDone = true
         }
+        frame, pts, dts := stream.parser.packet(stream, packet)
+        if demuxer.OnFrame != nil {
+            demuxer.OnFrame(stream.streamId, stream.cid, frame, pts, dts, stream.lost)
+        }
+        demuxer.emitChainFrame(stream, frame, stream.lost)
     default:
         return errors.New("unsupport  codec id ")
     }

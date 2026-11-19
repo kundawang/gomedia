@@ -105,10 +105,7 @@ func (opus *opusDemuxer) header(stream *oggStream, packet []byte) (err error) {
     if bytes.Equal([]byte("OpusHead"), packet[0:8]) {
         opus.extradata = make([]byte, len(packet))
         copy(opus.extradata, packet)
-        err = opus.ctx.ParseExtranData(packet)
-        if err != nil {
-            return err
-        }
+        return opus.ctx.ParseExtranData(packet)
     } else if bytes.Equal([]byte("OpusTags"), packet[0:8]) {
         return nil
     }
