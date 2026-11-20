@@ -109,6 +109,7 @@ func (opus *opusDemuxer) header(stream *oggStream, packet []byte) (err error) {
         if err != nil {
             return err
         }
+        return nil
     } else if bytes.Equal([]byte("OpusTags"), packet[0:8]) {
         return nil
     }

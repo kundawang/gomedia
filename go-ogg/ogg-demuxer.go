@@ -41,6 +41,20 @@ type Demuxer struct {
     state         DemuxState
     vparam        *VideoParam
     aparam        *AudioParam
+
+    // Integrity checking / recovery options.
+    // CheckMode defaults to CHECK_NONE which keeps the historical demux
+    // behavior (no CRC / sequence / continuation verification).
+    CheckMode    CheckMode
+    MaxScanBytes int                // max bytes scanned for the next capture pattern while recovering (default DEFAULT_MAX_SCAN_BYTES)
+    MaxPageBytes int                // max accepted page size in bytes (default MAX_OGG_PAGE_BYTES)
+    OnPageError  func(perr *PageError) // called for every detected integrity error in CHECK_STRICT / CHECK_RECOVER mode
+    OnGap        func(gap *GapEvent)   // called when recovery drops bytes/pages or detects lost pages
+
+    checkBuf    []byte
+    checkOffset int64
+    checkStates map[uint32]*serialCheckState
+    halted      error
 }
 
 func NewDemuxer() *Demuxer {
@@ -51,7 +65,39 @@ func NewDemuxer() *Demuxer {
     }
 }
 
-func (demuxer *Demuxer) Input(buf []byte) (err error) {
+// Input feeds ogg data into the demuxer. With the default CheckMode
+// (CHECK_NONE) it behaves exactly as before. With CHECK_STRICT / CHECK_RECOVER
+// every page is verified before it is demuxed, see ogg-check.go.
+func (demuxer *Demuxer) Input(buf []byte) error {
+    if demuxer.CheckMode == CHECK_NONE {
+        return demuxer.inputBytes(buf)
+    }
+    return demuxer.inputChecked(buf)
+}
+
+// Flush signals end of stream. In a checking mode it reports a truncated
+// trailing page (ERR_REASON_EOF_TRUNCATED) through OnPageError and returns
+// the error in CHECK_STRICT mode. It is a no-op in CHECK_NONE mode.
+func (demuxer *Demuxer) Flush() error {
+    if demuxer.CheckMode == CHECK_NONE {
+        return nil
+    }
+    if demuxer.halted != nil {
+        return demuxer.halted
+    }
+    for {
+        progress, err := demuxer.checkStep(true)
+        if err != nil {
+            demuxer.halted = err
+            return err
+        }
+        if !progress {
+            return nil
+        }
+    }
+}
+
+func (demuxer *Demuxer) inputBytes(buf []byte) (err error) {
 
     if len(buf) == 0 {
         return nil
@@ -97,14 +143,16 @@ func (demuxer *Demuxer) Input(buf []byte) (err error) {
             if found {
                 if stream.currentPage.pageSeq+1 != page.pageSeq {
                     stream.lost = 1
-                    if demuxer.OnPacket != nil {
-                        demuxer.OnPacket(stream.streamId, stream.currentPage.granulePos, stream.cache, 1)
+                    if len(stream.cache) > 0 {
+                        if demuxer.OnPacket != nil {
+                            demuxer.OnPacket(stream.streamId, stream.currentPage.granulePos, stream.cache, 1)
+                        }
+                        err = demuxer.readPacket(stream, stream.cache)
+                        if err != nil {
+                            return err
+                        }
+                        stream.cache = stream.cache[:0]
                     }
-                    err = demuxer.readPacket(stream, stream.cache)
-                    if err != nil {
-                        return err
-                    }
-                    stream.cache = stream.cache[:0]
                 } else {
                     stream.lost = 0
                 }
